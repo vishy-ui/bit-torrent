@@ -1,0 +1,36 @@
+PROJECT PHASES & ROADMAP - BITTORRENT CLIENT
+
+
+Phase 1: Bencode Parser (parser.py)
+- Bdecoding: Parsing integers (i...e), byte strings (<length>:...), lists (l...e), and dictionaries (d...e).
+- Bencoding: Converting Python data structures back into bencoded byte strings (crucial for hashing the info dictionary).
+
+Phase 2: Torrent Metadata & Info-Hash Extraction (calc_hash.py)
+- Reading and decoding .torrent files.
+- Extracting torrent metadata (File name, tracker announce URL, piece size, total length).
+- Calculating the SHA-1 Info-Hash of the bencoded info dictionary (used to identify torrents when communicating with trackers and peers).
+- Extracting piece hashes (20-byte SHA-1 chunks).
+
+
+Phase 3: Tracker Communication & Announce Request
+- Constructing HTTP / UDP announce requests to the tracker URL.
+- Sending parameters (info_hash, peer_id, port, uploaded, downloaded, left, event).
+- Parsing the tracker response to extract the list of available peers (IP addresses and ports).
+
+Phase 4: Peer Wire Protocol (Handshake & Connection)
+- Establishing TCP socket connections with peers.
+- Performing the BitTorrent Handshake:
+  pstrlength (1 byte) + pstr ("BitTorrent protocol") + reserved (8 bytes) + info_hash (20 bytes) + peer_id (20 bytes).
+- Parsing peer messages: bitfield, have, interested, unchoke, request, piece, etc.
+
+Phase 5: Piece Downloading & File Verification
+- Managing piece & block requests (downloading 16KB blocks per piece).
+- Managing connection states (choked, interested).
+- Verifying downloaded piece data against the SHA-1 piece hashes extracted in Phase 2.
+
+Phase 6: Disk I/O & File Assembly
+- Writing verified pieces to disk at correct offsets.
+- Handling single-file and multi-file torrent layouts.
+
+Phase 7: Concurrent Connections / Event Loop
+- Using asyncio or threading to connect to multiple peers simultaneously for fast downloading.

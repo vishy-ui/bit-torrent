@@ -1,0 +1,6 @@
+# Python bytecode / cache
+__pycache__/
+*.pyc
+
+# Large test torrent files (optional to ignore heavy binaries)
+# *.torrent
