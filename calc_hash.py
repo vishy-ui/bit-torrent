@@ -1,5 +1,6 @@
 from parser import bdecode, bencode
 import hashlib
+import os
 
 def calculate_info_hash(info_dict):
     """Calculates SHA-1 hash of bencoded info dictionary."""
@@ -17,11 +18,21 @@ def get_torrent_summary(torrent_file_path):
     decoded = bdecode(torrent_data)
     info_dict = decoded[b'info']
     
-    # Calculate Total Length
+    # Calculate Total Length and file layout
+    files_layout = []
     if b'length' in info_dict:
         total_length = info_dict[b'length']
+        file_name = info_dict.get(b'name', b'downloaded_file').decode('utf-8', 'ignore')
+        files_layout.append({'path': file_name, 'length': total_length})
     else:
-        total_length = sum(f[b'length'] for f in info_dict.get(b'files', []))
+        root_name = info_dict.get(b'name', b'download_dir').decode('utf-8', 'ignore')
+        total_length = 0
+        for f in info_dict.get(b'files', []):
+            length = f[b'length']
+            path_parts = [p.decode('utf-8', 'ignore') for p in f.get(b'path', [])]
+            rel_path = os.path.join(root_name, *path_parts) if path_parts else os.path.join(root_name, "unnamed")
+            files_layout.append({'path': rel_path, 'length': length})
+            total_length += length
             
     info_hash = calculate_info_hash(info_dict)
     
@@ -45,6 +56,7 @@ def get_torrent_summary(torrent_file_path):
         'name': info_dict.get(b'name', b'').decode('utf-8', 'ignore'),
         'piece_length': info_dict.get(b'piece length', 0),
         'total_length': total_length,
+        'files': files_layout,
         'info_hash': info_hash,
         'info_hash_hex': info_hash.hex(),
         'piece_hashes': extract_piece_hashes(info_dict.get(b'pieces', b''))

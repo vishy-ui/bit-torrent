@@ -2,5 +2,8 @@
 __pycache__/
 *.pyc
 
-# Large test torrent files (optional to ignore heavy binaries)
-# *.torrent
+# Downloads & binary pieces
+downloads/
+*.mkv
+*.mp4
+*.bin
