@@ -1,14 +1,14 @@
 import hashlib
 import time
 import socket
-from peer import PeerConnection, MSG_PIECE, MSG_UNCHOKE, MSG_CHOKE, MSG_HAVE, MSG_BITFIELD
+from peer import PeerConnection, MSG_PIECE, MSG_UNCHOKE, MSG_CHOKE, MSG_HAVE, MSG_BITFIELD, MSG_EXTENDED
 
 DEFAULT_BLOCK_SIZE = 16384  # 16 KB standard BitTorrent block size
 
+
 def verify_piece(piece_bytes: bytes, expected_hash_hex: str) -> bool:
     """Verifies SHA-1 hash of downloaded piece bytes against expected hex string."""
-    computed_hash = hashlib.sha1(piece_bytes).hexdigest()
-    return computed_hash.lower() == expected_hash_hex.lower()
+    return hashlib.sha1(piece_bytes).hexdigest() == expected_hash_hex.lower()
 
 
 def peer_has_piece(bitfield: bytes, piece_index: int) -> bool:
@@ -28,47 +28,93 @@ def download_piece_from_peer(
     piece_size: int,
     expected_hash_hex: str,
     block_size: int = DEFAULT_BLOCK_SIZE,
-    max_wait_seconds: float = 30.0
+    inactivity_timeout: float = 12.0,
+    pipeline_size: int = 64,
 ) -> bytes:
     """
-    Downloads a single piece from a peer by requesting 16KB blocks,
-    assembling them, and verifying against the expected SHA-1 hash.
-    """
-    peer_conn.socket.settimeout(max_wait_seconds)
+    Downloads a single piece from a peer by pipelining block requests,
+    handling packet drops with smart retransmission, and verifying SHA-1.
 
-    # 1. Express interest to peer
+    Optimizations applied:
+    - 64-block pipeline window (1 MB in-flight) for maximum throughput
+    - Zero-stall immediate pipeline replenishment upon receiving each block
+    - Tight 1.5s socket timeout loop
+    - 2.0s retransmission on stalled blocks
+    - Preallocated bytearray buffer with direct slice assignment
+    - Fast-path PIECE message unpacking
+    """
+    if not peer_conn.socket:
+        raise ConnectionError("Peer socket is closed")
+
+    peer_conn.socket.settimeout(1.5)
+
+    # 1. Express interest to peer if not already
     if not peer_conn.am_interested:
         peer_conn.send_interested()
 
     # 2. Prepare block request offsets
+    num_blocks = (piece_size + block_size - 1) // block_size
     blocks = []
     offset = 0
-    while offset < piece_size:
+    for _ in range(num_blocks):
         curr_len = min(block_size, piece_size - offset)
         blocks.append((offset, curr_len))
         offset += curr_len
 
-    received_blocks = {}
+    total_blocks = len(blocks)
+    received_count = 0
+    received_set = set()
     pending_blocks = list(blocks)
-    requested_blocks = set()
+    requested_blocks: dict[int, tuple[int, float]] = {}  # offset -> (len, req_time)
 
-    pipeline_size = 5  # Number of pipelined requests in flight
-    start_time = time.time()
+    # Preallocate assembly buffer
+    assembled = bytearray(piece_size)
+    last_data_time = time.monotonic()
 
-    while len(received_blocks) < len(blocks):
-        if time.time() - start_time > max_wait_seconds:
-            raise TimeoutError(f"Timed out downloading piece {piece_index} (received {len(received_blocks)}/{len(blocks)} blocks)")
+    def _replenish_pipeline(cur_time: float):
+        """Helper to keep in-flight request window filled up to pipeline_size."""
+        if peer_conn.peer_choked or not pending_blocks:
+            return
+        to_send = []
+        while pending_blocks and len(requested_blocks) < pipeline_size:
+            b_offset, b_len = pending_blocks.pop(0)
+            requested_blocks[b_offset] = (b_len, cur_time)
+            to_send.append((piece_index, b_offset, b_len))
+        if to_send:
+            peer_conn.send_requests_batch(to_send)
 
-        # If unchoked, pipeline requests
-        if not peer_conn.peer_choked:
-            while pending_blocks and len(requested_blocks) < pipeline_size:
-                b_offset, b_len = pending_blocks.pop(0)
-                requested_blocks.add(b_offset)
-                peer_conn.send_request(piece_index, b_offset, b_len)
+    # Initial pipeline prime
+    _replenish_pipeline(last_data_time)
+
+    while received_count < total_blocks:
+        now = time.monotonic()
+
+        # Inactivity check
+        if now - last_data_time > inactivity_timeout:
+            raise TimeoutError(
+                f"Peer stalled on piece {piece_index}: no data for {inactivity_timeout}s "
+                f"({received_count}/{total_blocks} blocks)"
+            )
+
+        # Retransmit stalled requests (threshold: 2.0s)
+        if requested_blocks:
+            stalled = [
+                bo for bo, (_, req_t) in requested_blocks.items() if now - req_t > 2.0
+            ]
+            if stalled:
+                for bo in stalled:
+                    blen, _ = requested_blocks.pop(bo)
+                    pending_blocks.append((bo, blen))
+
+        # Keep pipeline full
+        _replenish_pipeline(now)
 
         try:
             msg = peer_conn.read_message()
         except socket.timeout:
+            continue
+        except OSError:
+            # Handle "timed out" on Windows
             continue
 
         msg_id = msg['id']
@@ -77,45 +123,36 @@ def download_piece_from_peer(
             if msg.get('index') == piece_index:
                 b_offset = msg.get('begin')
                 block_data = msg.get('block', b'')
-                if b_offset in requested_blocks or b_offset not in received_blocks:
-                    received_blocks[b_offset] = block_data
-                    requested_blocks.discard(b_offset)
+                if b_offset not in received_set:
+                    # Write directly into preallocated buffer
+                    b_len = len(block_data)
+                    assembled[b_offset:b_offset + b_len] = block_data
+                    received_set.add(b_offset)
+                    received_count += 1
+                    requested_blocks.pop(b_offset, None)
+                    last_data_time = time.monotonic()
+                    # Immediately replenish pipeline to keep bandwidth saturated
+                    _replenish_pipeline(last_data_time)
 
         elif msg_id == MSG_UNCHOKE:
-            # Re-queue any in-flight requests that might have dropped
-            for b_offset in list(requested_blocks):
-                # find length
-                for bo, bl in blocks:
-                    if bo == b_offset:
-                        pending_blocks.insert(0, (bo, bl))
-                        break
+            # Peer unchoked us! Re-queue any in-flight requests and immediately prime
+            for bo, (blen, _) in list(requested_blocks.items()):
+                pending_blocks.insert(0, (bo, blen))
             requested_blocks.clear()
+            _replenish_pipeline(time.monotonic())
 
         elif msg_id == MSG_CHOKE:
             # Peer choked us; put requested blocks back into pending
-            for b_offset in list(requested_blocks):
-                for bo, bl in blocks:
-                    if bo == b_offset:
-                        pending_blocks.insert(0, (bo, bl))
-                        break
+            for bo, (blen, _) in list(requested_blocks.items()):
+                pending_blocks.insert(0, (bo, blen))
             requested_blocks.clear()
+            raise ConnectionError(f"Peer choked during piece {piece_index}")
 
-        elif msg_id == MSG_HAVE:
-            pass  # Peer announcing piece possession
+        elif msg_id in (MSG_HAVE, MSG_BITFIELD, MSG_EXTENDED):
+            pass
 
-        elif msg_id == MSG_BITFIELD:
-            pass  # Peer sent full bitfield
-
-    # 3. Assemble piece bytes in sequential order
-    assembled = bytearray()
-    for b_offset, b_len in blocks:
-        if b_offset not in received_blocks:
-            raise ValueError(f"Missing block at offset {b_offset} for piece {piece_index}")
-        assembled.extend(received_blocks[b_offset])
-
+    # 3. Verify piece hash
     piece_bytes = bytes(assembled)
-
-    # 4. Verify piece hash
     if not verify_piece(piece_bytes, expected_hash_hex):
         raise ValueError(
             f"Piece {piece_index} SHA-1 hash mismatch! "
@@ -123,4 +160,3 @@ def download_piece_from_peer(
         )
 
     return piece_bytes
-

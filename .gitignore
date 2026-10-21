@@ -7,3 +7,9 @@ downloads/
 *.mkv
 *.mp4
 *.bin
+
+
+.env
+.venv/
+venv/
+env/
