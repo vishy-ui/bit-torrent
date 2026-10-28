@@ -127,9 +127,18 @@ class DiskManager:
         verified = set()
         bytes_verified = 0
 
-        # Check if at least one file exists
-        any_exists = any(os.path.exists(item['path']) for item in self.file_ranges)
-        if not any_exists:
+        # Pre-fetch existing file byte spans
+        existing_spans = []
+        for item in self.file_ranges:
+            if os.path.exists(item['path']):
+                try:
+                    sz = os.path.getsize(item['path'])
+                    if sz > 0:
+                        existing_spans.append((item['start'], item['start'] + sz))
+                except Exception:
+                    pass
+
+        if not existing_spans:
             return verified, bytes_verified
 
         for idx, exp_hash in enumerate(piece_hashes):
@@ -137,6 +146,13 @@ class DiskManager:
             if idx == len(piece_hashes) - 1:
                 rem = self.total_length % self.piece_length
                 piece_size = rem if rem else self.piece_length
+
+            piece_start = idx * self.piece_length
+            piece_end = piece_start + piece_size
+
+            # Fast skip: verify only if actual file bytes exist in this range
+            if not any(piece_start < span_end and piece_end > span_start for span_start, span_end in existing_spans):
+                continue
 
             try:
                 data = self.read_piece(idx, piece_size)

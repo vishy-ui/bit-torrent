@@ -1,16 +1,8 @@
 import sys
 import os
-import io
 from calc_hash import get_torrent_summary
-from tracker import generate_peer_id, get_peers, get_all_trackers
+from tracker import generate_peer_id, get_peers
 from swarm_downloader import SwarmDownloader
-
-# Fix Windows console encoding for Unicode output
-if sys.stdout and hasattr(sys.stdout, 'reconfigure'):
-    try:
-        sys.stdout.reconfigure(encoding='utf-8', errors='replace')
-    except Exception:
-        pass
 
 
 def fmt_size(n: float) -> str:
@@ -21,7 +13,7 @@ def fmt_size(n: float) -> str:
 
 
 def main():
-    torrent_file = sys.argv[1] if len(sys.argv) > 1 else "spidy.torrent"
+    torrent_file = sys.argv[1] if len(sys.argv) > 1 else "one_piece.torrent"
 
     if not os.path.exists(torrent_file):
         print(f"Error: '{torrent_file}' not found.")
@@ -42,16 +34,11 @@ def main():
     print(f"  Tracker   : {summary['announce']}")
 
     peer_id = generate_peer_id()
-    trackers = get_all_trackers(summary)
+    trackers = summary.get("announce_list") or [summary["announce"]]
 
     peers = []
-    import threading
-    from concurrent.futures import ThreadPoolExecutor
-
-    peers_lock = threading.Lock()
-    print(f"\nQuerying {len(trackers)} trackers simultaneously...")
-
-    def _query(url):
+    print("\nQuerying trackers...")
+    for url in trackers:
         try:
             found = get_peers(
                 announce_url=url,
@@ -60,18 +47,12 @@ def main():
                 peer_id=peer_id,
             )
             if found:
-                with peers_lock:
-                    for p in found:
-                        if p not in peers:
-                            peers.append(p)
-                print(f"  [OK]  {url}  ->  {len(found)} peers")
+                peers.extend(p for p in found if p not in peers)
+                print(f"  {url}  ->  {len(found)} peers")
             else:
-                print(f"  [--]  {url}  ->  0 peers")
+                print(f"  {url}  ->  0 peers")
         except Exception as e:
-            print(f"  [FAIL] {url}  ->  {type(e).__name__}")
-
-    with ThreadPoolExecutor(max_workers=min(16, len(trackers) or 1)) as pool:
-        list(pool.map(_query, trackers))
+            print(f"  {url}  ->  failed ({type(e).__name__})")
 
     print(f"\nTotal unique peers: {len(peers)}")
     if not peers:
@@ -92,7 +73,7 @@ def main():
         peers=peers,
         peer_id=peer_id,
         download_dir=download_dir,
-        max_workers=40,
+        max_workers=30,
     )
 
     success = downloader.download()
