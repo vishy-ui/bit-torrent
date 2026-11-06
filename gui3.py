@@ -916,7 +916,7 @@ class TorrentWorker(QThread):
     sig_peers_count = Signal(int)
     sig_peer_status = Signal(str, int, str)
     sig_tracker_status = Signal(str, str, int)
-    sig_piece_done = Signal(int, int, int, float, float)  # idx, done_cnt, total, bytes, speed
+    sig_piece_done = Signal(int, int, int, int, float)  # idx, done_cnt, total, bytes_done, speed
     sig_finished = Signal(bool, str)
 
     def __init__(self, torrent_path: str, download_dir: str, max_workers: int = 30):
@@ -1918,7 +1918,7 @@ class QBitMainWindow(QMainWindow):
     # -----------------------------------------------------------------------
 
     def _start_torrent(self, item: TorrentItem):
-        if item.status == "Downloading" or item.worker:
+        if item.status == "Downloading" or (item.worker and item.worker.isRunning()):
             return
 
         item.status = "Downloading"
@@ -1954,8 +1954,9 @@ class QBitMainWindow(QMainWindow):
     def _on_worker_peer_status(self, item: TorrentItem, ip: str, port: int, status: str):
         key = f"{ip}:{port}"
         item.peer_map[key] = {"ip": ip, "port": port, "status": status}
-        if status == "Active / Unchoked":
-            item.peers_connected = sum(1 for p in item.peer_map.values() if p["status"] == "Active / Unchoked")
+        if status in ("Active / Unchoked", "Active / Streaming"):
+            item.peers_connected = sum(1 for p in item.peer_map.values()
+                                       if p["status"] in ("Active / Unchoked", "Active / Streaming"))
         if self.selected_torrent == item:
             self._refresh_peers_tab(item)
 
@@ -1965,9 +1966,9 @@ class QBitMainWindow(QMainWindow):
             self._refresh_trackers_tab(item)
 
     def _on_worker_piece_done(self, item: TorrentItem, idx: int, done_cnt: int, total: int,
-                              bytes_done: float, speed: float):
+                              bytes_done: int, speed: float):
         item.done_pieces.add(idx)
-        item.bytes_done = int(bytes_done)
+        item.bytes_done = bytes_done
         item.dl_speed = speed
         if speed > 0:
             rem_bytes = max(0, item.total_length - item.bytes_done)
@@ -2019,7 +2020,11 @@ class QBitMainWindow(QMainWindow):
             return
 
         row = rows[0].row()
-        name = self.transfer_table.item(row, 1).text()
+        item_widget = self.transfer_table.item(row, 1)
+        if not item_widget:
+            self.selected_torrent = None
+            return
+        name = item_widget.text()
         for t in self.torrents:
             if t.name == name:
                 self.selected_torrent = t
@@ -2145,8 +2150,7 @@ class QBitMainWindow(QMainWindow):
             self._log("Normal", f"Rechecking disk files for {self.selected_torrent.name} …")
             self.selected_torrent.recheck_existing()
             self._update_torrent_row(self.selected_torrent)
-            if self.selected_torrent == self.selected_torrent:
-                self._populate_details_for_torrent(self.selected_torrent)
+            self._populate_details_for_torrent(self.selected_torrent)
             self._log("Normal", f"Recheck complete: {len(self.selected_torrent.done_pieces)}/{self.selected_torrent.total_pieces} pieces verified.")
 
     def _on_resume_selected(self):
@@ -2183,10 +2187,15 @@ class QBitMainWindow(QMainWindow):
             if chk_files.isChecked():
                 # Delete files from disk
                 try:
-                    for f in target.files:
+                    files_to_delete = target.files or [{"path": target.name}]
+                    for f in files_to_delete:
                         fp = os.path.join(target.save_dir, f["path"])
-                        if os.path.exists(fp):
+                        if os.path.isfile(fp):
                             os.remove(fp)
+                    # If target has a folder created, remove if empty or matching torrent name
+                    top_dir = os.path.join(target.save_dir, target.name)
+                    if os.path.isdir(top_dir):
+                        shutil.rmtree(top_dir, ignore_errors=True)
                 except Exception as e:
                     self._log("Warning", f"Could not remove files from disk: {e}")
 
@@ -2199,11 +2208,16 @@ class QBitMainWindow(QMainWindow):
 
     def _rebuild_table_rows(self):
         self.transfer_table.setRowCount(0)
+        selected_row = -1
         for i, t in enumerate(self.torrents):
             t.priority = i + 1
             row = self.transfer_table.rowCount()
             self.transfer_table.insertRow(row)
             self._render_table_row(row, t)
+            if self.selected_torrent and t.info_hash == self.selected_torrent.info_hash:
+                selected_row = row
+        if selected_row >= 0:
+            self.transfer_table.selectRow(selected_row)
 
     def _move_priority(self, direction: str):
         if not self.selected_torrent or len(self.torrents) < 2:
@@ -2234,8 +2248,29 @@ class QBitMainWindow(QMainWindow):
         from PySide6.QtWidgets import QInputDialog
         url, ok = QInputDialog.getText(self, "Add Torrent Link", "Enter Magnet URI or HTTP Torrent Link:")
         if ok and url.strip():
-            self._log("Notice", f"Link added: {url.strip()}")
-            QMessageBox.information(self, "Torrent Link", "Magnet link accepted and registered to DHT.")
+            url = url.strip()
+            if url.startswith("http://") or url.startswith("https://"):
+                try:
+                    import tempfile
+                    import urllib.request
+                    req = urllib.request.Request(url, headers={'User-Agent': 'qBittorrent/4.6.5'})
+                    with urllib.request.urlopen(req, timeout=10) as response:
+                        content = response.read()
+                    temp_path = os.path.join(tempfile.gettempdir(), "downloaded.torrent")
+                    with open(temp_path, "wb") as f:
+                        f.write(content)
+                    self._load_and_prompt_torrent(temp_path)
+                except Exception as exc:
+                    QMessageBox.warning(self, "Download Error", f"Failed to download torrent from link:\n{exc}")
+            elif url.startswith("magnet:"):
+                self._log("Notice", f"Magnet link added: {url}")
+                QMessageBox.information(
+                    self,
+                    "Torrent Link",
+                    "Magnet link registered.\nNote: Direct swarm streaming via magnet requires the BEP 9 extension."
+                )
+            else:
+                QMessageBox.warning(self, "Invalid Link", "Please enter a valid HTTP/HTTPS torrent URL or magnet link.")
 
     def _load_and_prompt_torrent(self, torrent_path: str):
         try:
@@ -2268,7 +2303,10 @@ class QBitMainWindow(QMainWindow):
 
     def _apply_row_filters(self):
         for row in range(self.transfer_table.rowCount()):
-            name = self.transfer_table.item(row, 1).text()
+            item_widget = self.transfer_table.item(row, 1)
+            if not item_widget:
+                continue
+            name = item_widget.text()
             item = next((t for t in self.torrents if t.name == name), None)
             if not item:
                 continue

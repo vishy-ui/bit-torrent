@@ -15,6 +15,34 @@ A lightweight BitTorrent client implemented in pure Python from scratch without 
   - Generates standard 20-byte client Peer IDs (`-PY0001-...`).
   - Decodes compact 6-byte binary peer representations into IPv4 addresses and TCP ports.
 
+## Installation & Setup
+
+### Automated Setup (Installs Python if missing, sets up `.venv` & dependencies)
+
+- **Windows Batch (Double-click or CMD)**:
+  ```cmd
+  install.bat
+  ```
+- **PowerShell**:
+  ```powershell
+  .\install.ps1
+  ```
+
+*The installer will automatically detect if Python 3.10+ is installed; if not found, it downloads and installs Python silently for you, creates a virtual environment (`.venv`), and installs required dependencies (`PySide6`).*
+
+### Launching the Application
+
+- **Desktop GUI (qBittorrent clone)**:
+  ```cmd
+  run_gui.bat
+  ```
+  *Or directly: `.\.venv\Scripts\python.exe gui3.py`*
+
+- **CLI Swarm Downloader**:
+  ```cmd
+  .\.venv\Scripts\python.exe main.py spidy.torrent
+  ```
+
 ## Usage
 
 Run `main.py` with any `.torrent` file:
